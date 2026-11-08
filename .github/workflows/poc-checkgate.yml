@@ -1,0 +1,151 @@
+name: poc-checkgate
+
+# Structural reproduction of the authorization gap in
+# Azure/azure-quickstart-templates .github/workflows/ValidateSampleDeployments.yml
+#
+# In the real workflow:
+#   * `gate` protects everything with a commenter-authorization step. When the
+#     commenter is not MEMBER/OWNER/COLLABORATOR that step exits 1 -> gate fails.
+#   * `report-check` declares `needs: [gate, summarize, selected-pipeline]` but
+#     runs with `if: always() && ...` and contains NO commenter authorization.
+#     It then upserts (PATCHes) the `adx-deployment-validation` check run for the
+#     PR head SHA with a conclusion derived from needs.gate.result.
+#
+# Here `mode=seed` plays the legitimate /validate run (gate succeeds), and
+# `mode=attack` plays an unprivileged commenter's run (gate's auth step fails),
+# which still reaches report-check and overwrites the existing check run.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'seed (legit /validate) or attack (unauthorized commenter)'
+        required: true
+        default: seed
+      head_sha:
+        description: 'commit SHA the check run is attached to'
+        required: true
+
+permissions:
+  contents: read
+  checks: write
+  actions: read
+
+jobs:
+  gate:
+    name: gate
+    runs-on: ubuntu-latest
+    outputs:
+      head_sha: ${{ steps.pr-head.outputs.head_sha }}
+    steps:
+      - name: Check commenter permission (basic)
+        shell: bash
+        env:
+          ASSOC: ${{ inputs.mode == 'seed' && 'MEMBER' || 'NONE' }}
+        run: |
+          set -euo pipefail
+          echo "Comment author association: ${ASSOC}"
+          case "${ASSOC}" in
+            MEMBER|OWNER|COLLABORATOR) ;;
+            *)
+              echo "::error::Not authorized to /validate."
+              exit 1
+              ;;
+          esac
+
+      - name: Resolve PR HEAD SHA
+        id: pr-head
+        shell: bash
+        env:
+          HEAD_SHA: ${{ inputs.head_sha }}
+        run: |
+          set -euo pipefail
+          echo "head_sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Mark adx-deployment-validation check in_progress
+        shell: bash
+        env:
+          GH_TOKEN:    ${{ github.token }}
+          GH_REPO:     ${{ github.repository }}
+          CHECK_NAME:  adx-deployment-validation
+          HEAD_SHA:    ${{ inputs.head_sha }}
+          STATUS:      in_progress
+          TITLE:       Validating in progress…
+          SUMMARY:     waiting
+        run: bash .github/scripts/upsert-check-run.sh
+
+  report-check:
+    name: Report adx-deployment-validation check
+    runs-on: ubuntu-latest
+    needs: [gate]
+    if: >-
+      always()
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - name: Checkout helper scripts
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          sparse-checkout: |
+            .github/scripts
+          sparse-checkout-cone-mode: false
+
+      - name: Resolve PR HEAD SHA
+        id: pr-head
+        shell: bash
+        env:
+          HEAD_SHA: ${{ inputs.head_sha }}
+          GATE_SHA: ${{ needs.gate.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${GATE_SHA}" ]]; then
+            HEAD_SHA="${GATE_SHA}"
+          fi
+          if [[ -z "${HEAD_SHA}" ]]; then
+            echo "ERROR: could not resolve head SHA" >&2
+            exit 1
+          fi
+          echo "head_sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Determine final check conclusion
+        id: outcome
+        shell: bash
+        env:
+          GATE_RESULT: ${{ needs.gate.result }}
+        run: |
+          set -euo pipefail
+          echo "gate.result=${GATE_RESULT}"
+          # Mirrors the real workflow: a failed/unauthorized gate yields a
+          # *failure* conclusion for the required check.
+          if [[ "${GATE_RESULT}" == "success" ]]; then
+            conclusion="success"
+            title="ADX deployment validation passed"
+            summary="legit run"
+          else
+            conclusion="failure"
+            title="validate-samples.yml did not pass for this commit"
+            summary="attacker-authored failure overwriting the existing check"
+          fi
+          echo "conclusion=${conclusion}" >> "$GITHUB_OUTPUT"
+          {
+            echo "title<<__EOF__"
+            echo "${title}"
+            echo "__EOF__"
+            echo "summary<<__EOF__"
+            echo "${summary}"
+            echo "__EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upsert adx-deployment-validation check
+        shell: bash
+        env:
+          GH_TOKEN:    ${{ github.token }}
+          GH_REPO:     ${{ github.repository }}
+          CHECK_NAME:  adx-deployment-validation
+          HEAD_SHA:    ${{ steps.pr-head.outputs.head_sha }}
+          STATUS:      completed
+          CONCLUSION:  ${{ steps.outcome.outputs.conclusion }}
+          TITLE:       ${{ steps.outcome.outputs.title }}
+          SUMMARY:     ${{ steps.outcome.outputs.summary }}
+        run: bash .github/scripts/upsert-check-run.sh
